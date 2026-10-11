@@ -5,6 +5,11 @@ import traceback
 import faulthandler
 from pathlib import Path
 
+if '--convert-job' in sys.argv:
+    from isolated import run_job
+    run_job(sys.argv[sys.argv.index('--convert-job')+1])
+    sys.exit(0)
+
 if sys.stdout is None:
     sys.stdout = open(os.devnull, 'w', encoding='utf-8')
 if sys.stderr is None:

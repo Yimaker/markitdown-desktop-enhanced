@@ -4,10 +4,12 @@ from __future__ import annotations
 import os
 import tempfile
 import zipfile
+import json
+import hashlib
 from pathlib import Path
 
 SUPPORTED = {'.pdf', '.docx', '.pptx', '.xlsx', '.xls', '.html', '.htm',
-             '.csv', '.json', '.txt', '.md', '.xml'}
+             '.csv', '.json', '.txt', '.md', '.xml', '.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff', '.webp', '.epub', '.doc', '.ppt'}
 
 
 class UserError(Exception):
@@ -18,13 +20,14 @@ def make_converter():
     from markitdown import MarkItDown
     from markitdown.converters import (PlainTextConverter, HtmlConverter,
         DocxConverter, PptxConverter, XlsxConverter, XlsConverter, PdfConverter,
-        CsvConverter)
+        CsvConverter, EpubConverter)
     converter = MarkItDown(enable_builtins=False, enable_plugins=False)
     # Only offline document converters are registered, never URL/cloud/audio ones.
     converter.register_converter(PlainTextConverter(), priority=10)
     converter.register_converter(HtmlConverter(), priority=10)
-    for cls in (DocxConverter, PptxConverter, XlsxConverter, XlsConverter,
-                PdfConverter, CsvConverter):
+    from office_details import SeparatedPptxConverter
+    for cls in (DocxConverter, SeparatedPptxConverter, XlsxConverter, XlsConverter,
+                PdfConverter, CsvConverter, EpubConverter):
         converter.register_converter(cls())
     from math_pdf import MathPdfConverter
     converter.register_converter(MathPdfConverter())
@@ -33,6 +36,8 @@ def make_converter():
 
 def validate_source(path: Path):
     ext = path.suffix.lower()
+    if ext in {'.doc','.ppt'}:
+        raise UserError('旧版 DOC/PPT 尚未集成经过离线安全验证的本地转换器。本机即使安装 Office 也不会自动调用；请在 Office 中另存为 DOCX/PPTX 后再添加。不会通过改扩展名转换。')
     if ext not in SUPPORTED:
         raise UserError('暂不支持这个格式。请选择 PDF、Word、PPT、Excel 或文本文件。')
     if not path.is_file():
@@ -88,13 +93,69 @@ def save_atomic(folder: Path, stem: str, text: str) -> Path:
         temp.unlink(missing_ok=True)
 
 
-def convert_one(converter, source: Path, folder: Path):
+def convert_one(converter, source: Path, folder: Path, options=None):
     validate_source(source)
-    result = converter.convert_local(str(source))
-    text = result.text_content
+    from local_ocr import IMAGE_EXTENSIONS, ocr_image, convert_pdf_with_ocr
+    options=options or {}
+    progress=options.get('_progress',lambda message:None)
+    progress('检查原文件并提取内容')
+    with source.open('rb') as stream:initial_hash=hashlib.file_digest(stream,'sha256').hexdigest()
+    ocr_pages=[]
+    office_facts={}
+    if source.suffix.lower()=='.docx':
+        from office_details import docx_with_math
+        text,office_facts=docx_with_math(source)
+    elif source.suffix.lower() in IMAGE_EXTENSIONS:
+        text=ocr_image(source)['text']
+        ocr_pages=[1]
+    else:
+        text=None
+        if source.suffix.lower()=='.pdf':text,ocr_pages=convert_pdf_with_ocr(converter,source,options)
+        if text is None:text=converter.convert_local(str(source),keep_data_uris=True).text_content
+        if source.suffix.lower()=='.xlsx':
+            from office_details import excel_details
+            text+=excel_details(source)
     if not text or not text.strip():
-        raise UserError('未提取到可用文字。扫描版 PDF 需要先做 OCR，再重新转换。')
-    target = save_atomic(folder, source.stem, text)
+        raise UserError('未提取到可用文字。文件可能为空白、文字无法识别或受保护；请核对原文及 OCR 设置。')
+    from quality import diagnose, report_path, publish_report
+    progress('提取完成，正在生成质量诊断')
+    report = diagnose(source, text)
+    report.update(office_facts)
+    if office_facts.get('omml_objects'):
+        report['issues'].append(f'检测并逐项处理 {office_facts["omml_objects"]} 个原生 OMML 公式；不支持的公式编号：{office_facts["omml_failed"]}。计数不证明公式语义正确。')
+    if ocr_pages:
+        report['ocr_pages']=ocr_pages
+        report['status']='review';report['label']='已保存 · OCR 需要核对'
+        report['issues'].insert(0,f'使用 Windows 本地 OCR 的页码：{ocr_pages}。普通 OCR 不保证数学公式、表格结构正确；图片输入目前只处理首帧。')
+    from assets import Assets, export_assets
+    assets=Assets(folder,progress)
+    try:
+        text=export_assets(source,text,assets)
+        with source.open('rb') as stream:final_hash=hashlib.file_digest(stream,'sha256').hexdigest()
+        if initial_hash!=final_hash or report['source_sha256']!=initial_hash:
+            raise UserError('转换期间原文件发生变化，未发布结果。请关闭正在编辑该文件的程序后重试。')
+    except Exception:
+        assets.cleanup()
+        raise
+    report['assets']=assets.files
+    if not assets.files:assets.cleanup()
+    report['issues']=[x for x in report['issues'] if '本阶段尚未导出 PDF 插图' not in x and '当前未保证资产完整导出' not in x]
+    report['issues']+=assets.warnings
+    report['output_characters']=len(text)
+    if report['issues'] and not ocr_pages:
+        report['status']='review';report['label']='已保存 · 需要核对'
+    if source.suffix.lower()=='.pdf':report['issues'].append('附有逐页原图用于核对复杂公式和结构，原图不是已识别的 LaTeX；图片对象单独导出，矢量插图保留在页面核对图中。')
+    try:
+        progress('诊断和资产导出完成，正在提交结果')
+        target = save_atomic(folder, source.stem, text)
+    except Exception:
+        assets.cleanup();raise
+    try:
+        publish_report(target,report)
+    except Exception:
+        target.unlink(missing_ok=True)
+        assets.cleanup()
+        raise
     return target, text
 
 

@@ -29,7 +29,33 @@ LATEX={
 }
 
 def math_char(c):
-    return c.get('virtual',False) or 'Math' in c.get('fontname','') or any(0x1d400<=ord(ch)<=0x1d7ff for ch in c['text'])
+    return c.get('virtual',False) or c.get('_math_detected',False) or bool(re.search(r'math|cmmi|cmsy|cmex|stix|euler|symbol',c.get('fontname',''),re.I)) or any(0x1d400<=ord(ch)<=0x1d7ff or 0x2200<=ord(ch)<=0x22ff for ch in c['text'])
+
+def mark_geometric_scripts(chars):
+    """A smaller raised/lowered neighbour is evidence even in ordinary fonts.
+
+    This remains a candidate transcription; footnotes can resemble exponents.
+    """
+    grid=collections.defaultdict(list)
+    for b in chars:
+        if re.fullmatch(r'[A-Za-z0-9)]',b['text']):
+            grid[(int(b['x1']//24),int(baseline(b)//24))].append(b)
+    radius=min(4,max(1,int(max((c['size'] for c in chars),default=12)/24)+1))
+    for c in chars:
+        if not c['text'].strip():continue
+        x=int(c['x0']//24);y=int(baseline(c)//24)
+        nearby=(b for dx in range(-radius,radius+1) for dy in range(-radius,radius+1) for b in grid.get((x+dx,y+dy),()))
+        candidates=[b for b in nearby if b is not c and
+                    c['size']<b['size']*.82 and -.3*b['size']<=c['x0']-b['x1']<=b['size']*.6 and
+                    b['size']*.14<abs(baseline(c)-baseline(b))<b['size']*.85]
+        if candidates:
+            b=min(candidates,key=lambda b:abs(c['x0']-b['x1'])+abs(baseline(c)-baseline(b)))
+            # A superscript after a prose word is usually a footnote, not x^2.
+            bx=int(b['x0']//24);by=int(baseline(b)//24)
+            prior=(p for dx in (-1,0,1) for dy in (-1,0,1) for p in grid.get((bx+dx,by+dy),()))
+            if b['text'].isalpha() and any(p is not b and p['text'].isalpha() and -.1*b['size']<=b['x0']-p['x1']<.15*b['size'] and abs(baseline(b)-baseline(p))<.12*b['size'] for p in prior):
+                continue
+            b['_math_detected']=True;c['_math_detected']=True
 
 def glyph_tex(text):
     return ''.join(LATEX.get(ch,LATEX.get(unicodedata.normalize('NFKC',ch),unicodedata.normalize('NFKC',ch))) for ch in text)
@@ -224,14 +250,37 @@ def table_block(page,table,number):
 def extract_math_pdf(stream):
     blocks=[];math_count=0;script_count=0
     with pdfplumber.open(stream) as doc:
-        total=sum(len(p.chars) for p in doc.pages)
-        math_count=sum(math_char(c) for p in doc.pages for c in p.chars)
+        for page in doc.pages:
+            mark_geometric_scripts(page.chars)
+            math_count+=sum(math_char(c) for c in page.chars)
+            page.close()
         # Conservative routing avoids changing existing ordinary-document behavior.
-        if math_count<25 or math_count/max(total,1)<.02:return None
+        if math_count==0:return None
+        # Remove only repeated edge lines observed on multiple distinct pages.
+        # A one-off edge paragraph must survive regardless of its position.
+        edge_lines=[]
+        repeated=collections.Counter()
+        for page in doc.pages:
+            found=[]
+            for line in line_groups(page.chars):
+                cs=line['chars']
+                if not cs:continue
+                y=sum(center_y(c) for c in cs)/len(cs)
+                if y<page.height*.055 or y>page.height*.945:
+                    value=''.join(c['text'] for c in sorted(cs,key=lambda c:c['x0'])).strip()
+                    key=(re.sub(r'\d+','#',value),round(y/page.height,2))
+                    # Digits alone or labelled page counts are accepted only when repeated.
+                    found.append((key,min(c['top'] for c in cs),max(c['bottom'] for c in cs)))
+            edge_lines.append(found)
+            repeated.update(set(x[0] for x in found))
+            page.close()
+        threshold=max(2, int(len(doc.pages)*.6+.999))
         for number,page in enumerate(doc.pages,1):
+            mark_geometric_scripts(page.chars)
             tables=rule_tables(page)
             exclusions=[t.bbox for t in tables]
-            chars=[c for c in page.chars if page.height*.055<=center_y(c)<=page.height*.945 and not any(x0<=(c['x0']+c['x1'])/2<=x1 and top<=center_y(c)<=bottom for x0,top,x1,bottom in exclusions)]
+            edge_ranges=[(top,bottom) for key,top,bottom in edge_lines[number-1] if repeated[key]>=threshold]
+            chars=[c for c in page.chars if not any(top<=center_y(c)<=bottom for top,bottom in edge_ranges) and not any(x0<=(c['x0']+c['x1'])/2<=x1 and top<=center_y(c)<=bottom for x0,top,x1,bottom in exclusions)]
             script_count+=sum(math_char(c) and c['size']<mode_size(chars)*.82 for c in chars)
             chars=replace_arrow_labels(replace_fractions(page,chars))
             pageblocks=[table_block(page,t,number) for t in tables]
@@ -252,23 +301,23 @@ def extract_math_pdf(stream):
                 # Right-edge occupancy, in a scale-independent page measure.
                 pageblocks.append(Block(kind,text,number,top,bottom,x0,x1/page.width))
             blocks.extend(sorted(pageblocks,key=lambda b:b.top))
+            page.close()
     merged=[]
     for b in blocks:
-        if b.kind=='table' and merged and merged[-1].kind=='table' and b.page==merged[-1].page+1 and b.header==merged[-1].header:
-            merged[-1].rows.extend(b.rows)
-            merged[-1].page=b.page
-            merged[-1].bottom=b.bottom
-        elif (b.kind=='body' and merged and merged[-1].kind=='body' and not re.match(r'^\[\d+\]|^表\s*\d+',b.text) and
+        if (b.kind=='body' and merged and merged[-1].kind=='body' and not re.match(r'^\[\d+\]|^表\s*\d+',b.text) and
             merged[-1].x1>=.83 and
-            ((b.page==merged[-1].page and b.top-merged[-1].bottom<15) or
-             (b.page==merged[-1].page+1 and not re.search(r'[。！？：]$',merged[-1].text)))):
+            (b.page==merged[-1].page and b.top-merged[-1].bottom<15)):
             previous=merged[-1]
             separator=' ' if re.search(r'[A-Za-z0-9]$',previous.text) and re.match(r'[A-Za-z0-9]',b.text) else ''
             previous.text=(previous.text+separator+b.text).replace('$$','')
             previous.page=b.page;previous.bottom=b.bottom;previous.x1=b.x1
         else:merged.append(b)
     out=[]
+    previous_page=None
     for b in merged:
+        if b.page!=previous_page:
+            out.append(f'<!-- source-page: {b.page} -->')
+            previous_page=b.page
         if b.kind.startswith('h'):out.append('#'*int(b.kind[1])+' '+b.text)
         elif b.kind=='math':out.append('$$\n'+b.text+'\n$$')
         elif b.kind=='table':

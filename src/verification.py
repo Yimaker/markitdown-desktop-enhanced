@@ -11,7 +11,7 @@ from PySide6.QtCore import Qt,QTimer,QMimeData,QUrl,QPointF,QPoint,QObject,Slot,
 from PySide6.QtGui import QDragEnterEvent,QDropEvent,QDesktopServices,QTextDocument
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication,QTabBar
-from app import MainWindow
+from app import MainWindow, VERSION
 
 class UrlCapture(QObject):
     def __init__(self):
@@ -33,7 +33,7 @@ class Verifier(QObject):
         self.checks=[]
         self.heartbeat=0
         self.start_time=time.monotonic()
-        self.report={'version':'2.1.0','frozen':bool(getattr(sys,'frozen',False)),
+        self.report={'version':VERSION,'frozen':bool(getattr(sys,'frozen',False)),
             'executable':sys.executable,'bundle_root':getattr(sys,'_MEIPASS',None),
             'method':'Native Qt window.grab, QTest input, real QThread converters and Qt PDF rendering. Not manual mouse testing. External-open paths intercepted during tests.',
             'checks':self.checks}
@@ -113,10 +113,28 @@ class Verifier(QObject):
     def advance(self):
         try:
             w=self.window
-            if self.stage=='official':
+            if self.stage=='append':
+                self.check('packaged appended task remains available after active batch',w.entries[0].state=='success' and w.entries[1].state=='waiting')
+                self.report.update(passed=True,elapsed_seconds=round(time.monotonic()-self.start_time,2),heartbeat_ticks=self.heartbeat,bundle_inventory=self.inventory())
+                self.finish(0)
+            elif self.stage=='official':
                 for vector,e in zip(self.config['official'],w.entries[:5]):
                     self.check('official conversion '+e.path.suffix,e.state=='success',e.error)
                     missing=[s for s in vector['must_include'] if s not in e.text]
+                    from quality import read_report
+                    import re
+                    assets=read_report(e.output).get('assets',[])
+                    for expected in missing[:]:
+                        match=re.fullmatch(r'!\[(.*?)\]\([^)]+\)',expected)
+                        if match and any(f'![{match[1]}]({a["path"]})' in e.text and (e.output.parent/a['path']).is_file() and self.sha(e.output.parent/a['path'])==a['sha256'] for a in assets):
+                            missing.remove(expected)
+                    # The upstream placeholder is intentionally replaced by a usable
+                    # relative PNG reference; require actual exported bytes instead.
+                    if 'data:image/png;base64...' in missing:
+                        from quality import read_report
+                        assets=read_report(e.output).get('assets',[])
+                        if any(a['path'].endswith('.png') and a['path'] in e.text and (e.output.parent/a['path']).is_file() and self.sha(e.output.parent/a['path'])==a['sha256'] for a in assets):
+                            missing.remove('data:image/png;base64...')
                     extra=[s for s in vector['must_not_include'] if s in e.text]
                     self.check('official content '+e.path.suffix,not missing and not extra,{'missing':missing,'forbidden':extra,'characters':len(e.text)})
                     self.check('UTF-8 saved '+e.path.suffix,e.output.read_text(encoding='utf-8')==e.text)
@@ -219,7 +237,7 @@ class Verifier(QObject):
                 w.start_conversion()
                 w.worker.started_item.connect(lambda _:w.stop_conversion())
             elif self.stage=='cancel':
-                self.check('stop finishes current and leaves subsequent waiting',w.entries[0].state=='success' and all(e.state=='waiting' for e in w.entries[1:]),[e.state for e in w.entries])
+                self.check('stop terminates current process and leaves all tasks waiting',all(e.state=='waiting' for e in w.entries),[e.state for e in w.entries])
                 w.clear_queue()
                 w.add_files([str(self.text)])
                 bad_folder=self.root/'这里是文件'
@@ -263,12 +281,13 @@ class Verifier(QObject):
                 self.check('reference PDF native preview ready',pdf.ready and pdf.pdf_document.pageCount()>0)
                 firstpage=pdf.pdf_document.getAllText(0).text()
                 if self.config.get('reference_pdf'):
-                    self.check('synthetic math example preview','SYNTHETIC_MATH_EXAMPLE' in firstpage and pdf.pdf_document.pageCount()>0)
+                    self.check('synthetic math PDF preview','SYNTHETIC_MATH_EXAMPLE' in firstpage and pdf.pdf_document.pageCount()>0)
                     self.check('mathematical PDF exponent and subscripts preserved',r'u_{n}-l_{n}=2^{-n}' in e.text and r'x^{2}' in e.text and r'a_{m}-a_{n}' in e.text)
                     self.check('compound math scripts and fractions preserved',r'2^{-(n+1)}' in e.text and r'l_{n+1}' in e.text and r'\frac{u_{n}-l_{n}}{2}' in e.text)
-                    self.check('only synthetic drawn tables extracted',len(__import__('re').findall(r'^\| ---',e.text,__import__('re').M))==2)
-                    self.check('six synthetic Markdown problem headings',len(__import__('re').findall(r'^## 问题',e.text,__import__('re').M))==6)
-                    self.check('PDF page header and footer removed','SYNTHETIC_PAGE_HEADER' not in e.text and not __import__('re').search(r'第\s*\d+\s*页',e.text))
+                    self.check('two synthetic drawn tables; no invented cross-page merge',len(__import__('re').findall(r'^\| ---',e.text,__import__('re').M))==2)
+                    self.check('six Markdown problem headings',len(__import__('re').findall(r'^## 问题',e.text,__import__('re').M))==6)
+                    extracted=e.text.split('## 原文资产与核对图')[0]
+                    self.check('PDF repeated header/footer removed from extracted text; evidence image captions retain page numbers','SYNTHETIC_PAGE_HEADER' not in extracted and not __import__('re').search(r'第\s*\d+\s*页',extracted))
                 pdf.jump_page(1)
                 self.check('PDF page navigation',pdf.pdf_view.pageNavigator().currentPage()==min(1,pdf.pdf_document.pageCount()-1))
                 pdf.jump_page(-1)
@@ -284,10 +303,79 @@ class Verifier(QObject):
                 self.check('viewer header matches selected filename',current.title.full==e.output.name and (current.title.width()<current.title.fontMetrics().horizontalAdvance(current.title.full) or current.title.text()==current.title.full),{'full':current.title.full,'displayed':current.title.text(),'width':current.title.width()})
                 self.check('source and result in independent tabs',w.viewer.tabs.count()==2 and w.viewer.tabs.currentWidget().path==e.output)
                 self.check('no Python network connections needed',not self.network_attempts,self.network_attempts)
-                self.report.update(passed=True,elapsed_seconds=round(time.monotonic()-self.start_time,2),heartbeat_ticks=self.heartbeat,bundle_inventory=self.inventory())
-                self.finish(0)
+                sample=r'$x^{2}$ $\frac{a}{b}$ $$\frac{1}{1+\frac{a}{b}}$$ $$\begin{pmatrix}a&b\\c&d\end{pmatrix}$$'
+                self.math_tab=w.viewer.open_file('math-check',self.root/'formula-check.md',sample)
+                self.math_tab.show_math()
+                self.math_tab.math_worker.finished.connect(lambda:QTimer.singleShot(100,self.finish_math))
         except Exception as exc:
             self.fail(str(exc))
+    def finish_math(self):
+        try:
+            self.check('packaged local math renders exponent fraction nested fraction and matrix',len(self.math_tab.reader.math_images)==4)
+            from math_preview import render_formula
+            glyph=render_formula('x^{2}')
+            self.check('packaged math exponent glyph pixels visible',sum(glyph.pixelColor(x,y).alpha()>0 for x in range(glyph.width()) for y in range(glyph.height()))>30)
+            self.grab('12-local-math.png')
+            self.window.compare_entry(self.window.entries[0].id)
+            QTimer.singleShot(200,self.finish_comparison)
+        except Exception as exc:self.fail(str(exc))
+    def finish_comparison(self):
+        try:
+            tab=self.window.viewer.tabs.currentWidget()
+            self.check('packaged side-by-side PDF and Markdown',tab.comparison is not None)
+            tab.jump_page(1)
+            self.check('packaged comparison page locator',tab.comparison.raw.textCursor().position()>0)
+            # QPdfView renders asynchronously after navigation; wait for page ink,
+            # not merely a changed page number or a blank white page rectangle.
+            visible_ink=0
+            for _ in range(30):
+                QTest.qWait(100)
+                page_image=tab.pdf_view.viewport().grab().toImage()
+                visible_ink=sum(page_image.pixelColor(x,y).lightness()<180
+                    for x in range(page_image.width()//5,page_image.width()*4//5,3)
+                    for y in range(page_image.height()//5,page_image.height()*4//5,3))
+                if visible_ink>30:break
+            self.check('packaged comparison original page visibly rendered',visible_ink>30)
+            self.grab('13-comparison.png')
+            from history_store import HistoryStore
+            self.long_path=self.root/'long-history-result.md'
+            self.long_text='START\n'+'中文内容\n'*50000+'TAIL_FULL_TEXT_SEARCH'
+            self.long_path.write_text(self.long_text,encoding='utf-8',newline='\n')
+            self.long_hash=self.sha(self.long_path)
+            store=HistoryStore(self.root/'history-test.sqlite3')
+            store.record('independent source',self.long_path,self.long_text,'saved')
+            self.check('packaged persistent history searches complete content',len(HistoryStore(self.root/'history-test.sqlite3').search('TAIL_FULL_TEXT_SEARCH'))==1)
+            self.long_tab=self.window.viewer.open_file('long-check',self.long_path)
+            self.long_tab.ready_changed.connect(lambda:QTimer.singleShot(100,self.finish_long_view))
+        except Exception as exc:self.fail(str(exc))
+    def finish_long_view(self):
+        try:
+            tab=self.long_tab
+            self.check('packaged preview is disk-backed and chunked',tab.paged is not None and tab._text=='' and len(tab.raw.toPlainText())<=60000)
+            tab.find_box.setText('TAIL_FULL_TEXT_SEARCH');tab.find_next()
+            self.check('packaged search reaches beyond old preview cutoff',tab.raw.textCursor().selectedText()=='TAIL_FULL_TEXT_SEARCH')
+            tab.edit_btn.setChecked(True);tab.toggle_edit();tab.raw.insertPlainText('EDITED_FINAL_TEXT')
+            saved=tab.save_copy(self.root/'edited-copies',record_history=False)
+            self.check('packaged editing saves complete new copy without changing original',saved.read_text(encoding='utf-8').endswith('EDITED_FINAL_TEXT') and self.sha(self.long_path)==self.long_hash)
+            from PySide6.QtWidgets import QFileDialog
+            folder=self.root/'folder-import';(folder/'nested').mkdir(parents=True,exist_ok=True)
+            (folder/'nested'/'batch.txt').write_text('BATCH',encoding='utf-8')
+            original=QFileDialog.getExistingDirectory
+            QFileDialog.getExistingDirectory=lambda *args:str(folder)
+            try:self.window.import_folder()
+            finally:QFileDialog.getExistingDirectory=original
+            self.check('packaged recursive folder import',any(e.path.name=='batch.txt' for e in self.window.entries))
+            self.grab('14-long-editor.png')
+            self.window.exchanges[self.window.entries[0].id].show_diagnostics()
+            self.check('packaged diagnostics open in searchable scrollable viewer','诊断不等于正确率' in self.window.viewer.tabs.currentWidget().text)
+            self.window.clear_queue()
+            first=self.root/'append-first.txt';first.write_text('FIRST BATCH',encoding='utf-8')
+            second=self.root/'append-second.txt';second.write_text('ADDED WHILE BUSY',encoding='utf-8')
+            self.window.add_files([str(first)])
+            self.stage='append';self.window.start_conversion()
+            self.window.add_files([str(second)])
+            self.check('packaged accepts files while converting',self.window.busy and len(self.window.entries)==2)
+        except Exception as exc:self.fail(str(exc))
     def inventory(self):
         import magika
         base=Path(getattr(sys,'_MEIPASS',Path(magika.__file__).parent.parent))

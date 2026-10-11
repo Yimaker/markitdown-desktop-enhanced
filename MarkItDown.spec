@@ -4,13 +4,16 @@ from PyInstaller.utils.hooks import collect_data_files, collect_submodules, copy
 
 root = Path(SPECPATH)
 data = [(str(root / 'src' / 'app.ico'), '.')]
-for package in ['magika', 'mammoth', 'markitdown', 'onnxruntime', 'tzdata']:
+data += [(str(root / 'src' / 'resources'), 'resources')]
+data += [(str(root / 'src' / 'windows_ocr.ps1'), '.')]
+for package in ['magika', 'mammoth', 'markitdown', 'onnxruntime', 'tzdata','ziamath','ziafont','latex2mathml']:
     data += collect_data_files(package)
-for package in ['markitdown', 'magika', 'mammoth', 'pandas', 'openpyxl', 'xlrd', 'pdfminer.six', 'pdfplumber']:
+for package in ['markitdown', 'magika', 'mammoth', 'pandas', 'openpyxl', 'xlrd', 'pdfminer.six', 'pdfplumber','ziamath','ziafont','latex2mathml']:
     data += copy_metadata(package)
 hidden = collect_submodules('markitdown') + collect_submodules('mammoth') + collect_submodules('magika')
 hidden += ['pandas.io.excel._openpyxl', 'pandas.io.excel._xlrd', 'onnxruntime.capi.onnxruntime_pybind11_state', 'verification']
-a = Analysis([str(root / 'src' / 'launcher.py')], pathex=[str(root / 'src')],
+hidden += ['test_word_export']
+a = Analysis([str(root / 'src' / 'launcher.py')], pathex=[str(root / 'src'), str(root)],
     binaries=collect_dynamic_libs('onnxruntime'), datas=data, hiddenimports=hidden,
     excludes=['PySide6.QtWebEngineCore', 'PySide6.QtWebEngineWidgets', 'PySide6.QtWebEngineQuick',
               'tkinter', 'matplotlib', 'scipy',
@@ -23,8 +26,8 @@ a = Analysis([str(root / 'src' / 'launcher.py')], pathex=[str(root / 'src')],
 a.binaries = [item for item in a.binaries if Path(item[0]).name.lower()
               not in {'icuuc.dll', 'icudt78.dll', 'ucrtbase.dll'}
               and not Path(item[0]).name.lower().startswith('api-ms-')]
-# Installation provenance can contain private build-machine paths.
-a.datas = [item for item in a.datas if Path(item[0]).name.lower() != 'direct_url.json']
+# Never ship a developer's private installation source URL.
+a.datas=[item for item in a.datas if Path(item[0]).name.lower()!='direct_url.json']
 pyz = PYZ(a.pure)
 exe = EXE(pyz, a.scripts, a.binaries, a.datas, [], name='MarkItDown-Enhanced',
     debug=False, bootloader_ignore_signals=False, strip=False, upx=False,

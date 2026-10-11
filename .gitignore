@@ -53,3 +53,11 @@ direct_url.json
 *.tmp
 .DS_Store
 Thumbs.db
+
+# Required anonymous Word style template
+!src/resources/reference.docx
+*.sqlite
+*.sqlite3
+*.sqlite3-*
+*.diagnostics.json
+assets-*/

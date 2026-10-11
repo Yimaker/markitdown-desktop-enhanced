@@ -11,12 +11,12 @@ from PySide6.QtCore import Qt, QSize, QThread, Signal, QTimer, QSettings, QStand
 from PySide6.QtGui import QFont, QIcon, QDesktopServices, QKeySequence, QShortcut, QPalette, QColor
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QFrame, QVBoxLayout,
     QHBoxLayout, QStackedWidget, QScrollArea, QSplitter, QPushButton, QFileDialog,
-    QSizePolicy, QProgressBar, QToolButton)
+    QSizePolicy, QProgressBar, QToolButton, QComboBox, QCheckBox)
 from conversion import SUPPORTED, convert_one, make_converter, friendly_error
 from ui_common import STYLE, label, ElideLabel, icon, document_icon, button, tool, readable_size
 from viewer import ViewerPanel
 
-VERSION='2.1.0'
+VERSION='2.4.0'
 BASE=Path(getattr(sys,'_MEIPASS',Path(__file__).parent))
 
 @dataclass
@@ -24,27 +24,33 @@ class Entry:
     path: Path
     id: str=field(default_factory=lambda:uuid.uuid4().hex)
     state: str='waiting'
-    text: str=''
+    _text: str|None=''
+    text_length: int=0
     output: Path | None=None
     error: str=''
+    @property
+    def text(self):
+        return self._text if self._text is not None else self.output.read_text(encoding='utf-8')
+    @text.setter
+    def text(self,value):
+        self.text_length=len(value)
+        self._text=None if self.output and self.output.suffix.lower()=='.md' and len(value)>60000 else value
 
 class ConversionWorker(QThread):
     started_item=Signal(str)
     result=Signal(str,bool,str,str,str)
     progress=Signal(int,int)
-    def __init__(self,entries,folder):
+    detail=Signal(str)
+    cancelled=Signal(str)
+    def __init__(self,entries,folder,options=None):
         super().__init__()
         self.entries=[(e.id,e.path) for e in entries]
         self.folder=folder
+        self.options=options or {}
         self.stop_requested=threading.Event()
     def run(self):
-        converter=None
+        from isolated import convert_isolated, Cancelled
         init_error=None
-        try:
-            converter=make_converter()
-        except Exception:
-            logging.exception('Converter initialization failed')
-            init_error='转换组件未能加载，请重新启动程序；若仍失败，请重新解压便携包。'
         for number,(entry_id,source) in enumerate(self.entries,1):
             if self.stop_requested.is_set():
                 break
@@ -52,8 +58,11 @@ class ConversionWorker(QThread):
             try:
                 if init_error:
                     raise RuntimeError(init_error)
-                target,text=convert_one(converter,source,self.folder)
+                target,text=convert_isolated(source,self.folder,self.stop_requested,self.detail.emit,self.options)
                 self.result.emit(entry_id,True,str(target),text,'')
+            except Cancelled:
+                self.cancelled.emit(entry_id)
+                break
             except Exception as exc:
                 logging.exception('Conversion failed: %s',source)
                 self.result.emit(entry_id,False,'','',init_error or friendly_error(exc))
@@ -76,6 +85,7 @@ class Attachment(QPushButton):
         layout.setContentsMargins(10,9,14,9)
         layout.setSpacing(12)
         badge=label('','fileBadge')
+        self.badge=badge
         badge.setFixedSize(48,48)
         badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
         badge.setPixmap(document_icon(self.path.suffix,29).pixmap(29,29))
@@ -138,11 +148,22 @@ class Exchange(QWidget):
         self.retry_btn=button('重试这个文件',lambda:window.retry_entry(entry.id),name='subtle')
         ar.addWidget(self.copy_btn)
         ar.addWidget(self.folder_btn)
+        self.diagnostic_btn=button('质量诊断',self.show_diagnostics,name='subtle')
+        ar.addWidget(self.diagnostic_btn)
+        self.compare_btn=button('并排核对',lambda:window.compare_entry(entry.id),name='subtle')
+        ar.addWidget(self.compare_btn)
         ar.addWidget(self.retry_btn)
         ar.addStretch()
         rv.addWidget(self.actions)
         layout.addWidget(self.reply)
         self.refresh()
+    def show_diagnostics(self):
+        from quality import read_report,report_path
+        report=read_report(self.entry.output)
+        text=report['label']+'\n\n'+'\n\n'.join(report['issues'])+'\n\n诊断不等于正确率。点击右侧原文件可查看源文档。'
+        self.window.viewer.open_file(self.entry.id+'-diagnostics',report_path(self.entry.output),text)
+        self.window.show_viewer()
+
     def refresh(self):
         e=self.entry
         try:
@@ -156,8 +177,10 @@ class Exchange(QWidget):
         self.result_card.setVisible(e.state=='success')
         self.error_label.setVisible(e.state=='failed')
         self.actions.setVisible(e.state in {'success','failed'})
-        self.copy_btn.setVisible(e.state=='success')
+        self.copy_btn.setVisible(e.state=='success' and e.output.suffix.lower()=='.md')
         self.folder_btn.setVisible(e.state=='success')
+        self.diagnostic_btn.setVisible(e.state=='success')
+        self.compare_btn.setVisible(e.state=='success' and e.path.suffix.lower()=='.pdf')
         self.retry_btn.setVisible(e.state=='failed')
         self.retry_btn.setEnabled(not self.window.busy)
         if e.state=='running':
@@ -166,12 +189,14 @@ class Exchange(QWidget):
             self.reply_title.setText('这个文件没有转换成功')
             self.error_label.setText(e.error)
         elif e.state=='success':
-            self.reply_title.setText('转换完成')
+            from quality import read_report
+            self.reply_title.setText(read_report(e.output)['label'])
             self.result_card.path=e.output
+            self.result_card.badge.setPixmap(document_icon(e.output.suffix,29).pixmap(29,29))
             self.result_card.name.set_full(e.output.name)
             self.result_card.setToolTip(str(e.output))
             self.result_card.setAccessibleName('查看完成文件：'+e.output.name)
-            self.result_card.set_detail(f'Markdown · {len(e.text):,} 字符')
+            self.result_card.set_detail('Word · 可编辑文档 · 点击打开' if e.output.suffix.lower()=='.docx' else f'Markdown · {e.text_length:,} 字符')
 
 class MainWindow(QMainWindow):
     batch_finished=Signal()
@@ -184,6 +209,7 @@ class MainWindow(QMainWindow):
         self.closing=False
         self.expanded=False
         self.test_mode=test_mode
+        self.conversion_options={'ocr':'auto'}
         self.settings=QSettings('MarkItDownLocal','Desktop')
         documents=QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DocumentsLocation)
         default=str(Path(documents)/'MarkItDown 转换结果')
@@ -210,8 +236,11 @@ class MainWindow(QMainWindow):
         header.setContentsMargins(24,13,20,13)
         header.setSpacing(9)
         header.addWidget(label('MarkItDown','appTitle'))
-        header.addWidget(label('文档转换','small'))
+        header.addWidget(label('文档转换 · '+VERSION,'small'))
         header.addStretch()
+        header.addWidget(button('本地历史',self.open_history,name='subtle'))
+        header.addWidget(button('导入文件夹',self.import_folder,name='subtle'))
+        header.addWidget(button('OCR 设置',self.configure_ocr,name='subtle'))
         self.clear_btn=tool('new','新建转换 / 清空文件记录',self.clear_queue,36)
         header.addWidget(self.clear_btn)
         self.panel_btn=QToolButton()
@@ -246,7 +275,7 @@ class MainWindow(QMainWindow):
         t.setWordWrap(True)
         el.addWidget(t)
         el.addSpacing(12)
-        t=label('添加或拖入文件，生成可以阅读和复制的 Markdown。','muted')
+        t=label('添加或拖入文件，转换为 Markdown；也可选择 Markdown 转 Word。','muted')
         t.setWordWrap(True)
         t.setAlignment(Qt.AlignmentFlag.AlignCenter)
         el.addWidget(t)
@@ -289,6 +318,20 @@ class MainWindow(QMainWindow):
         cp=QVBoxLayout(self.composer)
         cp.setContentsMargins(14,14,14,12)
         cp.setSpacing(12)
+        mode_row=QHBoxLayout()
+        self.mode_combo=QComboBox()
+        self.mode_combo.addItems(['文档转 Markdown','Markdown 转 Word'])
+        self.mode_combo.setAccessibleName('转换方向')
+        self.mode_combo.currentIndexChanged.connect(self.mode_changed)
+        mode_row.addWidget(self.mode_combo)
+        self.appendix_check=QCheckBox('包含原文核对图附录')
+        self.appendix_check.setChecked(False)
+        self.appendix_check.setStyleSheet('QCheckBox::indicator {width: 14px; height: 14px; border: 1px solid #aaaaaa; border-radius: 3px;} QCheckBox::indicator:checked {background: #5b89b6;}')
+        self.appendix_check.setToolTip('只影响输出 Word，不修改原 Markdown；仅识别二级标题“原文资产与核对图”及其下属内容。')
+        self.appendix_check.hide()
+        mode_row.addWidget(self.appendix_check)
+        mode_row.addStretch()
+        cp.addLayout(mode_row)
         self.composer_title=label('添加文件，开始转换','muted')
         self.composer_title.setStyleSheet('padding: 3px 7px;')
         self.composer_title.setWordWrap(True)
@@ -325,7 +368,7 @@ class MainWindow(QMainWindow):
         self.summary.setWordWrap(True)
         self.summary.setContentsMargins(24,10,24,0)
         cv.addWidget(self.summary)
-        limits=label('本地转换 · 扫描件需先 OCR，公式和复杂表格请核对','small')
+        limits=label('本地转换与 OCR · 公式、表格及识别文字请核对','small')
         limits.setAlignment(Qt.AlignmentFlag.AlignCenter)
         limits.setWordWrap(True)
         limits.setContentsMargins(22,9,22,17)
@@ -344,17 +387,41 @@ class MainWindow(QMainWindow):
 
     def notify(self,text):
         self.summary.setText(text)
+    def mode_changed(self):
+        word=self.mode_combo.currentIndex()==1
+        self.appendix_check.setVisible(word)
+        self.notify('Markdown 转 Word：仅接受 .md；核对图附录默认不包含，原文件不变。' if word else '文档转 Markdown：使用原有转换流程。')
+    def configure_ocr(self):
+        from PySide6.QtWidgets import QInputDialog
+        choices=['仅识别疑似扫描页（默认）','不使用 OCR','指定 PDF 页码']
+        choice,ok=QInputDialog.getItem(self,'本地 OCR','设置用于之后开始的转换；普通 OCR 不保证公式正确。',choices,0,False)
+        if not ok:return
+        options={'ocr':['auto','off','selected'][choices.index(choice)]}
+        if options['ocr']=='selected':
+            pages,ok=QInputDialog.getText(self,'OCR 页码','页码从 1 开始，例如 1,3-5（应用于本批每份 PDF）')
+            if not ok:return
+            options['pages']=pages
+        self.conversion_options=options
+        self.notify('OCR 设置：'+choice+'；图片输入使用本地文字识别。')
+    def open_history(self):
+        from history_store import show_history
+        try:show_history(self)
+        except Exception as exc:self.notify('历史暂不可用：'+friendly_error(exc))
+    def import_folder(self):
+        chosen=QFileDialog.getExistingDirectory(self,'导入文件夹（包括子文件夹中的支持格式）','')
+        if chosen:
+            names=[]
+            for folder,dirs,files in os.walk(chosen,followlinks=False):
+                dirs[:]=[d for d in dirs if not Path(folder,d).is_symlink() and not Path(folder,d).is_junction() and not d.startswith('assets-')]
+                names.extend(str(Path(folder,name)) for name in files if Path(name).suffix.lower() in SUPPORTED)
+            self.add_files(names)
     def choose_files(self):
-        if self.busy:
-            return
+        supported={'.md'} if self.mode_combo.currentIndex()==1 else SUPPORTED
         names,_=QFileDialog.getOpenFileNames(self,'添加要转换的文档','',
-            '支持的文件 (*.pdf *.docx *.pptx *.xlsx *.xls *.html *.htm *.csv *.json *.txt *.md *.xml);;所有文件 (*)')
+            '支持的文件 ('+' '.join('*'+ext for ext in sorted(supported))+');;所有文件 (*)')
         if names:
             self.add_files(names)
     def add_files(self,names):
-        if self.busy:
-            self.notify('当前批次完成后，可以继续添加文件。')
-            return
         seen={os.path.normcase(str(e.path.resolve())) for e in self.entries}
         added=duplicate=unsupported=0
         for raw in names:
@@ -363,7 +430,8 @@ class MainWindow(QMainWindow):
             if key in seen:
                 duplicate+=1
                 continue
-            if path.suffix.lower() not in SUPPORTED or not path.is_file():
+            supported={'.md'} if self.mode_combo.currentIndex()==1 else SUPPORTED
+            if path.suffix.lower() not in supported or not path.is_file():
                 unsupported+=1
                 continue
             entry=Entry(path)
@@ -425,8 +493,10 @@ class MainWindow(QMainWindow):
         waiting=sum(e.state=='waiting' for e in self.entries)
         failed=sum(e.state=='failed' for e in self.entries)
         self.start_btn.setEnabled(bool(waiting+failed) and not self.busy)
-        self.add_btn.setEnabled(not self.busy)
+        self.add_btn.setEnabled(True)
         self.folder_btn.setEnabled(not self.busy)
+        self.mode_combo.setEnabled(not self.busy)
+        self.appendix_check.setEnabled(not self.busy)
         self.clear_btn.setEnabled(bool(self.entries) and not self.busy)
         self.stop_btn.setVisible(self.busy)
         self.progress.setVisible(self.busy)
@@ -456,10 +526,14 @@ class MainWindow(QMainWindow):
         self.stop_btn.setEnabled(True)
         self.progress.setRange(0,len(pending))
         self.progress.setValue(0)
-        self.worker=ConversionWorker(pending,self.folder)
+        options=dict(self.conversion_options)
+        options.update(direction='md-to-docx' if self.mode_combo.currentIndex()==1 else 'to-markdown',include_review_appendix=self.appendix_check.isChecked())
+        self.worker=ConversionWorker(pending,self.folder,options)
         self.worker.started_item.connect(self.item_started)
         self.worker.result.connect(self.item_result)
         self.worker.progress.connect(self.on_progress)
+        self.worker.detail.connect(self.notify)
+        self.worker.cancelled.connect(self.item_cancelled)
         self.worker.finished.connect(self.conversion_finished)
         self.update_controls()
         self.notify(f'正在准备转换组件，共 {len(pending)} 个文件。')
@@ -477,6 +551,18 @@ class MainWindow(QMainWindow):
         e.output=Path(output) if success else None
         e.text=text
         e.error=error
+        if not self.test_mode:
+            try:
+                from history_store import HistoryStore
+                from quality import read_report
+                HistoryStore().record(e.path,e.output,text,read_report(e.output)['label'] if success else error)
+            except Exception:
+                logging.exception('History save failed; output remains saved')
+                self.notify('结果已处理，但本地历史未能写入；请保留结果文件。')
+        self.exchanges[entry_id].refresh()
+    def item_cancelled(self,entry_id):
+        e=self.entry(entry_id)
+        e.state='waiting'
         self.exchanges[entry_id].refresh()
     def on_progress(self,done,total):
         self.progress.setValue(done)
@@ -485,7 +571,7 @@ class MainWindow(QMainWindow):
         if self.busy and self.worker:
             self.worker.stop_requested.set()
             self.stop_btn.setEnabled(False)
-            self.notify('正在停止后续任务；当前文件处理完成后，剩余文件会保留。')
+            self.notify('正在停止当前转换进程；未发布的临时结果会清理，文件保留待重试。')
     def conversion_finished(self):
         self.busy=False
         worker=self.worker
@@ -500,6 +586,11 @@ class MainWindow(QMainWindow):
             bits.append(f'{bad} 个失败，可查看原因并重试')
         if waiting:
             bits.append(f'{waiting} 个等待转换')
+        review=sum(e.state=='success' and __import__('quality').read_report(e.output).get('status')=='review' for e in self.entries)
+        if review:bits.append(f'{review} 个结果需要核对，请查看质量诊断')
+        if any(e.output and e.output.suffix.lower()=='.md' for e in self.entries):
+            bits.append('含图片的 Markdown 请与对应 assets 文件夹一起复制或发送')
+        elif good:bits.append('Word 图片已嵌入，可独立发送')
         self.notify('；'.join(bits))
         self.batch_finished.emit()
         if self.closing:
@@ -512,8 +603,14 @@ class MainWindow(QMainWindow):
         if not path.is_file():
             self.notify('文件已移动或删除，请重新选择。')
             return None
+        if result and path.suffix.lower()=='.docx':
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+            return None
         self.show_viewer()
-        text=e.text if result or (e.state=='success' and e.path.suffix.lower() in {'.docx','.pptx','.xlsx','.xls'}) else None
+        text=e._text if result or (e.state=='success' and e.path.suffix.lower() in {'.docx','.pptx','.xlsx','.xls'}) else None
+        if not result and e.state=='success' and e._text is None and e.path.suffix.lower() in {'.docx','.pptx','.xlsx','.xls'}:
+            from paged_text import PagedText
+            text=PagedText(e.output)
         tab=self.viewer.open_file((entry_id,'result' if result else 'source'),path,text,extracted=not result and text is not None)
         for row in self.exchanges.values():
             for card in [row.source_card,row.result_card]:
@@ -547,8 +644,18 @@ class MainWindow(QMainWindow):
     def copy_entry(self,entry_id):
         e=self.entry(entry_id)
         if e and e.state=='success':
-            QApplication.clipboard().setText(e.text)
-            self.notify(f'已复制 {len(e.text):,} 个字符。')
+            try:
+                text=e.text
+                QApplication.clipboard().setText(text)
+                self.notify(f'已复制 {len(text):,} 个字符。')
+            except OSError:self.notify('结果文件已移动或无法读取，请从历史记录检查保存路径。')
+    def compare_entry(self,entry_id):
+        e=self.entry(entry_id)
+        if e and e.output and e.path.suffix.lower()=='.pdf':
+            tab=self.viewer.open_file(entry_id+'-compare',e.path)
+            tab.add_comparison(e.output,e._text)
+            self.show_viewer()
+            if not self.expanded:self.toggle_expand()
     def open_entry_folder(self,entry_id):
         e=self.entry(entry_id)
         folder=e.output.parent if e and e.output else self.folder
@@ -558,7 +665,7 @@ class MainWindow(QMainWindow):
         except OSError:
             self.notify('无法打开这个保存位置，请选择其他文件夹。')
     def dragEnterEvent(self,event):
-        if event.mimeData().hasUrls() and not self.busy:
+        if event.mimeData().hasUrls():
             event.acceptProposedAction()
     def dropEvent(self,event):
         self.add_files([u.toLocalFile() for u in event.mimeData().urls() if u.isLocalFile()])
@@ -568,6 +675,8 @@ class MainWindow(QMainWindow):
             self.close_timer.stop()
             self.close()
     def closeEvent(self,event):
+        if not all(tab.preserve_draft() for tab in list(self.viewer.keys.values())):
+            event.ignore();return
         if self.busy or self.viewer.has_jobs():
             self.closing=True
             self.stop_conversion()
@@ -608,7 +717,10 @@ def main():
     from logging.handlers import RotatingFileHandler
     handler=RotatingFileHandler(log_dir/'conversion.log',maxBytes=1000000,backupCount=2,encoding='utf-8')
     logging.basicConfig(handlers=[handler],level=logging.WARNING)
-    if '--verify' in sys.argv:
+    if '--verify-word' in sys.argv:
+        from word_verification import run
+        run(app,Path(sys.argv[sys.argv.index('--verify-word')+1]))
+    elif '--verify' in sys.argv:
         from verification import run_verification
         run_verification(app,Path(sys.argv[sys.argv.index('--verify')+1]))
     else:
